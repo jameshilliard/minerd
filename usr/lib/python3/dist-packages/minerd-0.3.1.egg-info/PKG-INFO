@@ -1,0 +1,15 @@
+Metadata-Version: 1.1
+Name: minerd
+Version: 0.3.1
+Summary: 21 miner daemon.
+Home-page: https://github.com/21dotco/minerd
+Author: 21
+Author-email: info@21.co
+License: TBD
+Description: 21 miner daemon.
+Keywords: minerd miner bitcoin 21 devkit
+Platform: UNKNOWN
+Classifier: Intended Audience :: Developers
+Classifier: Topic :: System :: Hardware :: Hardware Drivers
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.4

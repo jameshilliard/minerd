@@ -1,0 +1,432 @@
+#!/usr/bin/python3
+
+import sys
+assert sys.version_info >= (3, 4), "Python 3.4 or later is required to run minerd."
+
+import os
+import os.path
+import errno
+import time
+import logging
+import logging.handlers
+import asyncio
+import signal
+import argparse
+import collections
+import pwd
+import grp
+
+import minerhal
+import minerdaemon
+
+
+MINERD_PID_FILE = "/run/minerd.pid"
+"""PID file path."""
+
+MINERD_LOG_DIR = "/var/log/minerd"
+"""Log directory."""
+
+MINERD_SOCK_FILE = "/tmp/minerd.sock"
+"""minertop UNIX socket file path."""
+
+MINERD_RUN_USER = os.environ.get("MINERD_RUN_USER", "nobody")
+"""User to run daemon under."""
+
+MINERD_RUN_GROUP = os.environ.get("MINERD_RUN_GROUP", "nobody")
+"""Group to run daemon under."""
+
+SupportedMiners = collections.OrderedDict([
+    ("rpi2miner", minerhal.RPi2Miner),
+    ("cpuminer", minerhal.CpuMiner),
+])
+"""Supported minerhal miners table."""
+
+SupportedClients = collections.OrderedDict([
+    ("dummy", ("dummy://<difficulty>", minerdaemon.clients.DummyClient)),
+    ("stratum+tcp", ("stratum+tcp://<host>:<port>", minerdaemon.clients.StratumClient)),
+    ("swirl+tcp", ("swirl+tcp://<host>:<port>", minerdaemon.clients.SwirlClient)),
+    ("swirl+ssl", ("swirl+ssl://<host>:<port>", minerdaemon.clients.SwirlClient)),
+])
+"""Supported clients table."""
+
+
+def pid_file_read(path):
+    """Read PID file.
+
+    Args:
+        path (str): PID file path.
+
+    Returns:
+        int or None: PID or None if PID file doesn't exist.
+
+    """
+    if os.path.exists(path):
+        with open(path) as f:
+            return int(f.read())
+
+    return None
+
+
+def pid_is_running(pid):
+    """Check if process is running.
+
+    Args:
+        pid (int): PID.
+
+    Returns:
+        bool: True if process is running, False if it is not.
+
+    """
+    try:
+        os.kill(pid, 0)
+    except OSError as e:
+        if e.errno == errno.ESRCH:
+            return False
+
+    return True
+
+
+def pid_kill(pid, signal=signal.SIGTERM, timeout=5.0):
+    """Kill process, with timeout.
+
+    Args:
+        pid (int): PID.
+        signal (int): Signal to use with kill.
+        timeout (float): Timeout in seconds to wait for process to die.
+
+    Returns:
+        bool: True if process was killed successfully, False if it was not.
+
+    """
+    # Kill the PID
+    try:
+        os.kill(pid, signal)
+    except OSError as e:
+        if e.errno == errno.ESRCH:
+            return True
+
+    # Wait until it exits or timeout
+    tic = time.time()
+    while True:
+        if not pid_is_running(pid):
+            break
+
+        if (time.time() - tic) > timeout:
+            return False
+
+        time.sleep(0.1)
+
+    return True
+
+
+def daemonize(pidfile, user, group):
+    """Daemonize this process, writing the daemon PID to specified PID file,
+    and dropping privileges to the specified user and group.
+
+    Daemonizing includes a fork, creating a session ID, another fork,
+    changing directory to /, resetting umask, writing the PID file,
+    reopening file descriptors 0, 1, 2 as /dev/null, and dropping
+    privileges to a uid/gid.
+
+    Args:
+        pidfile (str): PID file path.
+        user (str): Username.
+        group (str): Group.
+
+    """
+    # Look up uid and gid of user/group to run under
+    uid = pwd.getpwnam(user).pw_uid
+    gid = grp.getgrnam(group).gr_gid
+
+    # First fork
+    if os.fork() != 0:
+        sys.exit(0)
+
+    # Create session
+    os.setsid()
+
+    # Second fork
+    if os.fork() != 0:
+        sys.exit(0)
+
+    # Change directory
+    os.chdir("/")
+
+    # Clear umask
+    os.umask(0)
+
+    # Write pid file
+    with open(pidfile, "w") as f:
+        f.write("{}\n".format(os.getpid()))
+
+    # Report pid
+    print("minerd started with pid {}.".format(os.getpid()))
+
+    # Reopen stdin/stdout/stderr as /dev/null
+    fd = os.open("/dev/null", os.O_RDWR)
+    os.dup2(fd, 0)
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    os.close(fd)
+
+    # Drop privileges
+    os.setgid(gid)
+    os.setuid(uid)
+
+
+@asyncio.coroutine
+def shutdown(reason, loop, miner, work_manager, solution_watcher, monitor, client, event_dispatcher):
+    """Shutdown minerd tasks and stop the asyncio event loop.
+
+    Args:
+        loop (asyncio.BaseEventLoop): Event loop.
+        miner (minerhal.Miner): Miner.
+        work_manager (WorkManager): Work manager task.
+        solution_watcher (SolutionWatcher): Solution watcher task.
+        monitor (Monitor): Monitor task.
+        client (Client): Client task.
+        event_dispatcher (EventDispatcher): Event dispatcher task.
+
+    """
+    event_dispatcher.dispatch(minerdaemon.events.ShutdownEvent("{} - Shutting down...".format(reason)))
+    event_dispatcher.dispatch(minerdaemon.events.ShutdownEvent("Shutting down work manager..."))
+    yield from work_manager.stop()
+    event_dispatcher.dispatch(minerdaemon.events.ShutdownEvent("Shutting down solution watcher..."))
+    yield from solution_watcher.stop_and_join()
+    event_dispatcher.dispatch(minerdaemon.events.ShutdownEvent("Shutting down monitor..."))
+    yield from monitor.stop_and_join()
+    event_dispatcher.dispatch(minerdaemon.events.ShutdownEvent("Shutting down client..."))
+    yield from client.stop_and_join()
+    event_dispatcher.dispatch(minerdaemon.events.ShutdownEvent("Shutting down event dispatcher..."))
+    yield from event_dispatcher.stop_and_join()
+    loop.stop()
+    miner.close()
+
+
+def log_exception_handler(logger, loop, context):
+    """Logging exception handler for asyncio loop.
+
+    Args:
+        logger (logging.Logger): Logger.
+        loop (asyncio.BaseEventLoop): Event loop.
+        context (dict): Context of exception.
+
+    """
+    logger.error("Exception occured during loop: {}".format(context))
+
+
+if __name__ == "__main__":
+    description = "minerd v{version}\n\n".format(version=minerdaemon.__version__) + \
+        "supported urls:\n" + \
+        "".join(["    {}\n".format(url_help) for (url_help, _) in SupportedClients.values()]) + \
+        "\n" + \
+        "supported miners:\n" + \
+        "".join(["    {}\n".format(miner_name) for miner_name in SupportedMiners.keys()]) + \
+        "\n"
+    parser = argparse.ArgumentParser(description=description, formatter_class=argparse.RawTextHelpFormatter, add_help=False)
+    parser.add_argument("url", help="pool url (e.g. dummy://16.0)", default=None, nargs="?", metavar="url")
+    parser.add_argument("-m", "--miner", help="miner (default: rpi2miner)", default="rpi2miner", choices=SupportedMiners.keys())
+    parser.add_argument("-u", "--username", help="pool username", metavar="username")
+    parser.add_argument("-p", "--password", help="pool password", metavar="password")
+    parser.add_argument("--splunk-log-url", help="Splunk logging URL (for miner performance reporting)", metavar="url")
+    parser.add_argument("-f", "--foreground", help="run in foreground (default: false)", action="store_true")
+    parser.add_argument("--status", help="get status of running minerd", action="store_true")
+    parser.add_argument("--stop", help="stop a running minerd", action="store_true")
+    parser.add_argument("-h", "--help", help="show this help and exit", action="help")
+    parser.add_argument("-v", "--version", help="show program version and exit", action="version", version="%(prog)s v{}".format(minerdaemon.__version__))
+    args = parser.parse_args()
+
+    # Read existing pid and get running status
+    pid = pid_file_read(MINERD_PID_FILE)
+    running = bool(pid and pid_is_running(pid))
+
+    if args.status:
+        if running:
+            print("minerd is running.")
+        else:
+            print("minerd is not running.")
+
+        sys.exit(0)
+    elif args.stop:
+        if running:
+            print("minerd is running.")
+            print("sending SIGTERM to pid {}".format(pid))
+            if pid_kill(pid):
+                print("minerd successfully shutdown.")
+            else:
+                print("error: minerd shutdown timed out.")
+                sys.exit(1)
+        else:
+            print("minerd is not running.")
+
+        sys.exit(0)
+
+    # Print help if no pool URL was provided
+    if not args.url:
+        parser.print_help()
+        sys.exit(1)
+
+    # Check if minerd is already running
+    if running:
+        print("error: minerd is already running!")
+        print("please stop minerd with: minerd --stop")
+        sys.exit(1)
+
+    # Validate URL
+    url_scheme = args.url.split(":")[0]
+    if url_scheme not in SupportedClients:
+        sys.stderr.write("error: unsupported url scheme.\n")
+        sys.exit(1)
+
+    # Look up miner and client classes
+    miner_class = SupportedMiners[args.miner]
+    client_class = SupportedClients[url_scheme][1]
+
+    # Setup logging
+    logger = logging.getLogger('minerd')
+    logger.setLevel(logging.DEBUG)
+
+    if not args.foreground:
+        uid = pwd.getpwnam(MINERD_RUN_USER).pw_uid
+        gid = grp.getgrnam(MINERD_RUN_GROUP).gr_gid
+
+        # Create minerd log directory
+        try:
+            os.mkdir(MINERD_LOG_DIR)
+        except FileExistsError:
+            pass
+        except Exception as e:
+            sys.stderr.write("error: creating minerd log directory: {}\n".format(str(e)))
+            sys.exit(1)
+
+        # Change ownership of minerd log directory to our run user/group
+        try:
+            os.chown(MINERD_LOG_DIR, uid, gid)
+        except Exception as e:
+            sys.stderr.write("error: setting permissions on minerd log directory: {}\n".format(str(e)))
+            sys.exit(1)
+
+        # Log file handler
+        ch = logging.handlers.TimedRotatingFileHandler(MINERD_LOG_DIR + "/minerd.log", when='D', interval=1, backupCount=7)
+        formatter = logging.Formatter("%(asctime)s %(message)s")
+        formatter.default_msec_format = "%s.%03d"
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
+
+        # Change ownership of minerd log file to our run user/group
+        try:
+            os.chown(MINERD_LOG_DIR + "/minerd.log", uid, gid)
+        except Exception as e:
+            sys.stderr.write("error: setting permissions on minerd log file: {}\n".format(str(e)))
+            sys.exit(1)
+
+        class ExceptionFilter:
+            def filter(self, record):
+                return not record.exc_info
+
+        # Temporary stderr log handler for startup info/errors
+        eh = logging.StreamHandler(sys.stderr)
+        eh.setLevel(logging.INFO)
+        eh.setFormatter(formatter)
+        eh.addFilter(ExceptionFilter())
+        logger.addHandler(eh)
+    else:
+        # Stdout log handler
+        ch = logging.StreamHandler(sys.stdout)
+        formatter = logging.Formatter("%(asctime)s %(message)s")
+        formatter.default_msec_format = "%s.%03d"
+        ch.setFormatter(formatter)
+        logger.addHandler(ch)
+
+    # Open the miner
+    try:
+        miner = SupportedMiners[args.miner]()
+    except Exception as e:
+        logger.error("Error starting minerd. Miner open error: %s", str(e))
+        logger.exception(e)
+        sys.exit(1)
+
+    # Initialize and self-test the miner
+    try:
+        miner.initialize()
+
+        logger.info("Running miner %s self-test...", miner.name)
+        results = miner.selftest()
+        if not results['passed']:
+            raise Exception("Miner self-test failed: {}".format(results['report']))
+
+        logger.info("Miner self-test passed: %s", results['report'])
+    except Exception as e:
+        logger.error("Error starting minerd. Miner error: %s", str(e))
+        logger.exception(e)
+
+        # Close the miner
+        miner.close()
+
+        sys.exit(1)
+
+    logger.info("Starting minerd %s with miner %s...", minerdaemon.__version__, miner.name)
+
+    loop = asyncio.get_event_loop()
+
+    # Create main tasks
+    try:
+        event_dispatcher = minerdaemon.eventdispatcher.EventDispatcher(loop)
+        event_dispatcher.add_backend(minerdaemon.eventbackends.LoggerBackend(loop, logger, enable_colors=args.foreground))
+        event_dispatcher.add_backend(minerdaemon.eventbackends.StatisticsBackend(loop, event_dispatcher, 10.0, 5.0))
+        event_dispatcher.add_backend(minerdaemon.eventbackends.TopServerBackend(loop, MINERD_SOCK_FILE))
+        if args.splunk_log_url:
+            event_dispatcher.add_backend(minerdaemon.eventbackends.SplunkLoggerBackend(loop, args.splunk_log_url))
+
+        work_manager = minerdaemon.workmanager.WorkManager(loop, miner, event_dispatcher)
+        monitor = minerdaemon.monitor.Monitor(loop, miner, event_dispatcher, 10.0)
+        solution_watcher = minerdaemon.solutionwatcher.SolutionWatcher(loop, miner, work_manager, event_dispatcher)
+        client = client_class(loop, work_manager, event_dispatcher, args.url, args.username, args.password)
+    except Exception as e:
+        logger.error("Error starting minerd: %s", str(e))
+        logger.exception(e)
+
+        # Cancel any pending tasks from above
+        for task in asyncio.Task.all_tasks():
+            task.cancel()
+
+        # Close the miner
+        miner.close()
+
+        sys.exit(1)
+
+    # Daemonize
+    if not args.foreground:
+        logger.info("Daemonizing...")
+
+        try:
+            daemonize(MINERD_PID_FILE, MINERD_RUN_USER, MINERD_RUN_GROUP)
+        except Exception as e:
+            logger.error("Error daemonizing: %s", str(e))
+            logger.exception(e)
+
+            # Cancel any pending tasks from above
+            for task in asyncio.Task.all_tasks():
+                task.cancel()
+
+            # Close the miner
+            miner.close()
+
+            sys.exit(1)
+
+        # Remove stderr logging handler
+        logger.removeHandler(eh)
+
+    # Register shutdown signal handler
+    for (sig, sig_name) in [(signal.SIGINT, "SIGINT"), (signal.SIGTERM, "SIGTERM")]:
+        loop.add_signal_handler(sig, asyncio.async, shutdown("Got signal {}".format(sig_name), loop, miner, work_manager, solution_watcher, monitor, client, event_dispatcher))
+
+    # Set up loop exception handler to exception log handler
+    loop.set_exception_handler(lambda loop, context: log_exception_handler(logger, loop, context))
+
+    # Dispatch version event
+    event_dispatcher.dispatch(minerdaemon.events.VersionEvent(minerdaemon.__version__, miner.name))
+
+    # Run
+    loop.run_forever()
+    loop.close()

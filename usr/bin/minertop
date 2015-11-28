@@ -1,0 +1,717 @@
+#!/usr/bin/python3
+
+import sys
+assert sys.version_info >= (3, 4), "Python 3.4 or later is required to run minertop."
+
+import os
+import socket
+import select
+import signal
+import curses
+import collections
+import datetime
+
+from minerdaemon.events import Event, VersionEvent, MonitorEvent, StatisticsEvent, WorkEvent, SolutionEvent, HardwareErrorEvent, NetworkEvent, ShutdownEvent
+
+
+class DisconnectEvent(Event):
+    """Pseudo-Event to signal daemon disconnected."""
+    pass
+
+
+class DimensionsError(Exception):
+    """Dimensions error exception."""
+    pass
+
+
+Point = collections.namedtuple("Point", ["y", "x"])
+"""Point container used to store the offsets of constant text in windows."""
+
+Dimensions = collections.namedtuple("Dimensions", ["y", "x"])
+"""Dimensions container used to specify the minimum dimensions of windows."""
+
+MINIMUM_SCREEN_DIMENSIONS = Dimensions(40, 110)
+"""Minimum screen dimensions to render Overview and Monitor windows."""
+
+MINIMUM_WINDOW_DIMENSIONS = Dimensions(3, 20)
+"""Minimum window dimensions threshold for any window to disable any
+rendering."""
+
+TOP_WINDOW_HEIGHT = 19
+"""Height of Overview and Monitor windows."""
+
+
+class OverviewWindow:
+    """Overview window that renders general information like software version,
+    connectivity status, share counts, and hashrate."""
+
+    TITLE_OFFSET = Point(1, 1)
+    """Offset of "Overview" title."""
+
+    COLUMN_OFFSET = Point(3, 3)
+    """Offset of field names."""
+
+    COLUMN_WIDTH = 20
+    """Width of field names."""
+
+    def __init__(self, win):
+        """Create an instance of OverviewWindow.
+
+        Args:
+            win (curses.WindowObject): Curses window.
+
+        """
+        self.win = win
+        (self.height, self.width) = win.getmaxyx()
+        self.version_event = None
+        self.network_event = None
+        self.previous_event = None
+        self.current_event = None
+        self.redraw()
+
+    def _statistic_haschanged(self, *keys):
+        """Check if statistic has changed between previous event and current
+        event.
+
+        Args:
+            keys (tuple): Path of keys to value in statistics dictionary.
+
+        Returns:
+            bool: True if statistic has changed since previous event, False if
+                it has not.
+
+        """
+        if self.previous_event is None:
+            return True
+
+        old_value = self.previous_event.statistics
+        new_value = self.current_event.statistics
+        for key in keys:
+            old_value = old_value[key]
+            new_value = new_value[key]
+
+        return new_value != old_value
+
+    def resize(self):
+        """Redraw the window after it has been resized."""
+        (self.height, self.width) = self.win.getmaxyx()
+        self.redraw()
+
+    def _addstr(self, y, x, s, attr=0):
+        """Draw a string in the window, but terminate it with elipses "..." if
+        its length exceeds the window width.
+
+        Args:
+            y (int): Y offset from window origin (0,0).
+            x (int): X offset from window origin (0,0).
+            s (str): String to draw.
+            attr (int): Curses attributes.
+
+        """
+        if len(s) > self.width - x - 1:
+            s = s[:self.width - x - 1 - 3]
+            s += "..."
+
+        self.win.addstr(y, x, s, attr)
+
+    def redraw(self):
+        """Redraw the window."""
+
+        self.win.clear()
+        self.win.border()
+
+        # Draw nothing if window is too small for anything
+        if self.height < MINIMUM_WINDOW_DIMENSIONS.y or self.width < MINIMUM_WINDOW_DIMENSIONS.x:
+            self.win.refresh()
+            return
+
+        # Draw title in top left
+        title = "Overview"
+        self._addstr(OverviewWindow.TITLE_OFFSET[0], OverviewWindow.TITLE_OFFSET[1], title, curses.A_BOLD)
+
+        # Draw warning if window is too small for overview
+        if self.height < TOP_WINDOW_HEIGHT or self.width < MINIMUM_SCREEN_DIMENSIONS.x // 2:
+            s = "Window too small!"
+            self._addstr(self.height // 2, self.width // 2 - len(s) // 2, s)
+            self.win.refresh()
+            return
+
+        # Bail out if there is no statistics event to draw
+        if self.current_event is None:
+            self.win.refresh()
+            return
+
+        # Draw timestamp on top right
+        timestr = datetime.datetime.fromtimestamp(self.current_event.timestamp).strftime("%H:%M:%S.%f")
+        self._addstr(OverviewWindow.TITLE_OFFSET[0], self.width - len(timestr) - 1, timestr)
+
+        column_width = OverviewWindow.COLUMN_WIDTH
+        ypos, xpos = OverviewWindow.COLUMN_OFFSET
+
+        # Draw version
+        version = self.version_event.version if self.version_event is not None else ""
+        self._addstr(ypos, xpos, "{:<{column_width}}{}".format("minerd version", version, column_width=column_width))
+        ypos += 1
+
+        # Draw miner name
+        miner = self.version_event.miner if self.version_event is not None else ""
+        self._addstr(ypos, xpos, "{:<{column_width}}{}".format("miner name", miner, column_width=column_width))
+        ypos += 1
+
+        # Draw uptime
+        uptime_days, rem = divmod(self.current_event.statistics['uptime'], 86400)
+        uptime_hrs, rem = divmod(rem, 3600)
+        uptime_mins, rem = divmod(rem, 60)
+        uptime_secs, rem = divmod(rem, 1)
+        s = "{:.0f} days {:.0f} hrs {:.0f} mins {:.0f} secs".format(uptime_days, uptime_hrs, uptime_mins, uptime_secs)
+        self._addstr(ypos, xpos, "{:<{column_width}}{}".format("uptime", s, column_width=column_width))
+        ypos += 2
+
+        # Draw pool URL
+        pool_url = self.network_event.url if self.network_event is not None else "unknown"
+        self._addstr(ypos, xpos, "{:<{column_width}}{}".format("pool url", pool_url, column_width=column_width))
+        ypos += 1
+
+        # Draw pool username
+        pool_username = self.network_event.username if self.network_event is not None else ""
+        self._addstr(ypos, xpos, "{:<{column_width}}{}".format("pool username", pool_username, column_width=column_width))
+        ypos += 1
+
+        # Draw connected status
+        connected = self.network_event.connected if self.network_event is not None else "unknown"
+        self._addstr(ypos, xpos, "{:<{column_width}}{}".format("connected", connected, column_width=column_width))
+        ypos += 2
+
+        # Draw accepted/rejected/invalid shares
+        self._addstr(ypos, xpos, "{:<{column_width}}{}".format("accepted shares", self.current_event.statistics['accepted_shares'], column_width=column_width), curses.A_BOLD if self._statistic_haschanged('accepted_shares') else 0)
+        ypos += 1
+        self._addstr(ypos, xpos, "{:<{column_width}}{}".format("rejected shares", self.current_event.statistics['rejected_shares'], column_width=column_width), curses.A_BOLD if self._statistic_haschanged('rejected_shares') else 0)
+        ypos += 1
+        self._addstr(ypos, xpos, "{:<{column_width}}{}".format("invalid shares", self.current_event.statistics['invalid_shares'], column_width=column_width), curses.A_BOLD if self._statistic_haschanged('invalid_shares') else 0)
+        ypos += 2
+
+        # Calculate hashrate scale
+        max_hashrate = max([self.current_event.statistics['hashrate'][t] for t in ("5min", "15min", "60min")])
+        if max_hashrate > 1e12:
+            (hashrate_units, hashrate_divider) = ("TH", 1e12)
+        elif max_hashrate > 1e9:
+            (hashrate_units, hashrate_divider) = ("GH", 1e9)
+        elif max_hashrate > 1e6:
+            (hashrate_units, hashrate_divider) = ("MH", 1e6)
+        elif self.current_event.statistics['hashrate']['5min'] > 1e3:
+            (hashrate_units, hashrate_divider) = ("KH", 1e3)
+        else:
+            (hashrate_units, hashrate_divider) = ("H", 1)
+
+        # Draw hash rate
+        self._addstr(ypos, xpos, "{:<{column_width}}{}".format("", "{:>6} {:>6} {:>6}".format("5m", "15m", "60m"),
+                     column_width=column_width), curses.A_BOLD if self._statistic_haschanged("hashrate", "5min") else 0)
+        ypos += 1
+        self._addstr(ypos, xpos, "{:<{column_width}}{}".format("adjusted hashrate", "{:6.2f} {:6.2f} {:6.2f}  {units}/s".format(
+            self.current_event.statistics['hashrate']['5min'] / hashrate_divider,
+            self.current_event.statistics['hashrate']['15min'] / hashrate_divider,
+            self.current_event.statistics['hashrate']['60min'] / hashrate_divider,
+            units=hashrate_units
+        ), column_width=column_width), curses.A_BOLD if self._statistic_haschanged("hashrate", "5min") else 0)
+        ypos += 1
+
+        self.win.refresh()
+
+    def update(self, event):
+        """Update the window state with a new event.
+
+        Args:
+            event (Event): Event.
+
+        """
+        if isinstance(event, VersionEvent):
+            self.version_event = event
+            return
+        if isinstance(event, NetworkEvent):
+            self.network_event = event
+            return
+        if isinstance(event, StatisticsEvent):
+            self.previous_event = self.current_event
+            self.current_event = event
+            self.redraw()
+
+
+class MonitorWindow:
+    """Monitor window that renders miner statistics."""
+
+    TITLE_OFFSET = Point(1, 1)
+    """Offset of "Monitor" title."""
+
+    COLUMN_OFFSET = Point(3, 3)
+    """Offset of field names."""
+
+    COLUMN_WIDTH = 20
+    """Width of field names."""
+
+    VALUE_OFFSET = 4
+    """Offset between field names column and data."""
+
+    def __init__(self, win):
+        """Create an instance of MonitorWindow.
+
+        Args:
+            win (curses.WindowObject): Curses window.
+
+        """
+        self.win = win
+        (self.height, self.width) = win.getmaxyx()
+        self.previous_event = None
+        self.current_event = None
+        self.redraw()
+
+    def resize(self):
+        """Redraw the window after it has been resized."""
+        (self.height, self.width) = self.win.getmaxyx()
+        self.redraw()
+
+    def _addstr(self, y, x, s, attr=0):
+        """Draw a string in the window, but terminate it with elipses "..." if
+        its length exceeds the window width.
+
+        Args:
+            y (int): Y offset from window origin (0,0).
+            x (int): X offset from window origin (0,0).
+            s (str): String to draw.
+            attr (int): Curses attributes.
+
+        """
+        if len(s) > self.width - x - 1:
+            s = s[:self.width - x - 1 - 3]
+            s += "..."
+
+        self.win.addstr(y, x, s, attr)
+
+    def redraw(self):
+        """Redraw the window."""
+
+        self.win.clear()
+        self.win.border()
+
+        # Draw nothing if window is too small for anything
+        if self.height < MINIMUM_WINDOW_DIMENSIONS.y or self.width < MINIMUM_WINDOW_DIMENSIONS.x:
+            self.win.refresh()
+            return
+
+        # Draw title in top left
+        title = "Monitor"
+        self._addstr(MonitorWindow.TITLE_OFFSET.y, MonitorWindow.TITLE_OFFSET.x, title, curses.A_BOLD)
+
+        # Draw warning if window is too small for monitor
+        if self.height < TOP_WINDOW_HEIGHT or self.width < MINIMUM_SCREEN_DIMENSIONS.x // 2:
+            s = "Window too small!"
+            self._addstr(self.height // 2, self.width // 2 - len(s) // 2, s)
+            self.win.refresh()
+            return
+
+        # Bail out if there is no monitor event to draw
+        if self.current_event is None:
+            self.win.refresh()
+            return
+
+        # Draw timestamp on top right
+        timestr = datetime.datetime.fromtimestamp(self.current_event.timestamp).strftime("%H:%M:%S.%f")
+        self._addstr(MonitorWindow.TITLE_OFFSET.y, self.width - len(timestr) - 1, timestr)
+
+        # Draw statistics
+        name_column_width = max(map(len, self.current_event.statistics.keys())) + MonitorWindow.VALUE_OFFSET
+        ypos, xpos = MonitorWindow.COLUMN_OFFSET
+
+        for (name, value) in self.current_event.statistics.items():
+            # Draw name, value
+            s = "{:<{column_width}}{}".format(name, value, column_width=name_column_width)
+            if self.previous_event is None or value != self.previous_event.statistics[name]:
+                self._addstr(ypos, xpos, s, curses.A_BOLD)
+            else:
+                self._addstr(ypos, xpos, s)
+            ypos += 1
+
+        self.win.refresh()
+
+    def update(self, event):
+        """Update the window state with a new event.
+
+        Args:
+            event (Event): Event.
+
+        """
+        if not isinstance(event, MonitorEvent):
+            return
+
+        self.previous_event = self.current_event
+        self.current_event = event
+        self.redraw()
+
+
+class LoggingWindow:
+    """Logging window that renders real-time events."""
+
+    BORDER_HEIGHT = 4
+    """Height of border and title."""
+
+    TITLE_OFFSET = Point(1, 1)
+    """Offset of "Log" title."""
+
+    LOG_OFFSET = Point(3, 1)
+    """Offset of start of log."""
+
+    EVENT_COLOR_MAP = {
+        SolutionEvent: curses.COLOR_GREEN,
+        WorkEvent: curses.COLOR_BLUE,
+        HardwareErrorEvent: curses.COLOR_RED,
+        MonitorEvent: curses.COLOR_MAGENTA,
+        StatisticsEvent: curses.COLOR_MAGENTA,
+        NetworkEvent: curses.COLOR_CYAN,
+        ShutdownEvent: curses.COLOR_YELLOW,
+        DisconnectEvent: curses.COLOR_YELLOW,
+    }
+    """Map of event types to curses colors."""
+
+    def __init__(self, win):
+        """Create an instance of LoggingWindow.
+
+        Args:
+            win (curses.WindowObject): Curses window.
+
+        """
+        self.win = win
+        (self.height, self.width) = win.getmaxyx()
+        self.events = []
+        self.redraw()
+
+    def resize(self):
+        """Redraw the window after it has been resized."""
+        (self.height, self.width) = self.win.getmaxyx()
+        self.events = self.events[-(self.height - LoggingWindow.BORDER_HEIGHT - 1):]
+        self.redraw()
+
+    def _addstr(self, y, x, s, attr=0):
+        """Draw a string in the window, but terminate it with elipses "..." if
+        its length exceeds the window width.
+
+        Args:
+            y (int): Y offset from window origin (0,0).
+            x (int): X offset from window origin (0,0).
+            s (str): String to draw.
+            attr (int): Curses attributes.
+
+        """
+        if len(s) > self.width - x - 1:
+            s = s[:self.width - x - 1 - 3]
+            s += "..."
+
+        self.win.addstr(y, x, s, attr)
+
+    def redraw(self):
+        """Redraw the window."""
+
+        self.win.clear()
+        self.win.border()
+
+        # Draw nothing if window is too small for anything
+        if self.height < MINIMUM_WINDOW_DIMENSIONS.y or self.width < MINIMUM_WINDOW_DIMENSIONS.x:
+            self.win.refresh()
+            return
+
+        # Draw title in top left
+        title = "Log"
+        self._addstr(LoggingWindow.TITLE_OFFSET.y, LoggingWindow.TITLE_OFFSET.x, title, curses.A_BOLD)
+
+        # Draw warning if window is too small for log
+        if self.width < MINIMUM_SCREEN_DIMENSIONS.x // 2:
+            s = "Window too small!"
+            self._addstr(self.height // 2, self.width // 2 - len(s) // 2, s)
+            self.win.refresh()
+            return
+
+        # Bail out if there are no events to draw
+        if len(self.events) == 0:
+            self.win.refresh()
+            return
+
+        # Draw timestamp on top right
+        timestr = datetime.datetime.fromtimestamp(self.events[-1].timestamp).strftime("%H:%M:%S.%f")
+        self._addstr(1, self.width - len(timestr) - 1, timestr)
+
+        # Draw events
+        event_column_width = max(map(lambda e: len(e.type), self.events))
+        ypos = LoggingWindow.LOG_OFFSET.y
+        for event in self.events:
+            xpos = LoggingWindow.LOG_OFFSET.x
+
+            # Draw timestamp
+            s = datetime.datetime.fromtimestamp(event.timestamp).strftime("[%Y-%m-%d %H:%M:%S] ")
+            self._addstr(ypos, xpos, s)
+            xpos += len(s)
+
+            # Draw event type
+            s = "{:>{column_width}} ".format(event.type, column_width=event_column_width)
+            self._addstr(ypos, xpos, s, curses.color_pair(LoggingWindow.EVENT_COLOR_MAP[type(event)]))
+            xpos += len(s)
+
+            # Draw event details
+            if isinstance(event, WorkEvent):
+                s = "Loaded new work with difficulty {:g}.".format(event.difficulty)
+            elif isinstance(event, SolutionEvent):
+                if not event.valid:
+                    s = "Invalid solution."
+                elif event.valid and not event.accepted:
+                    s = "Rejected solution. Classification: {}.".format(event.response.classification.name)
+                elif event.valid and event.accepted:
+                    s = "Accepted by pool."
+            elif isinstance(event, HardwareErrorEvent):
+                s = "Context: {}, Error: {}".format(event.context, event.error)
+            elif isinstance(event, MonitorEvent):
+                s = "Updated monitor."
+            elif isinstance(event, StatisticsEvent):
+                s = "Updated statistics."
+            elif isinstance(event, NetworkEvent):
+                s = "{} Connected: {}, url: {}.".format(event.message, event.connected, event.url)
+            elif isinstance(event, ShutdownEvent):
+                s = event.message
+            elif isinstance(event, DisconnectEvent):
+                s = "minerd disconnected. Press q or Ctrl-c to exit minertop."
+
+            self._addstr(ypos, xpos, s)
+            xpos += len(s)
+
+            ypos += 1
+
+        self.win.refresh()
+
+    def update(self, event):
+        """Update the window state with a new event.
+
+        Args:
+            event (Event): Event.
+
+        """
+        if type(event) not in [WorkEvent, SolutionEvent, HardwareErrorEvent,
+                               MonitorEvent, StatisticsEvent, NetworkEvent,
+                               ShutdownEvent, DisconnectEvent]:
+            return
+
+        self.events.append(event)
+        self.events = self.events[-(self.height - LoggingWindow.BORDER_HEIGHT):]
+        self.redraw()
+
+
+class StatusBarWindow:
+    """Status bar window that currently just renders quit instructions."""
+
+    def __init__(self, win):
+        """Create an instance of StatusBarWindow.
+
+        Args:
+            win (curses.WindowObject): Curses window.
+
+        """
+        self.win = win
+        (self.height, self.width) = win.getmaxyx()
+        self.redraw()
+
+    def resize(self):
+        """Redraw the window after it has been resized."""
+        (self.height, self.width) = self.win.getmaxyx()
+        self.redraw()
+
+    def redraw(self):
+        """Redraw the window."""
+        self.win.clear()
+
+        # Quit instructions
+        s = "Press q or Ctrl-c to exit minertop."
+
+        # Draw nothing if window is too small for anything
+        if self.width < len(s) + 5:
+            self.win.refresh()
+            return
+
+        # Draw quit instructions
+        self.win.addstr(0, 1, s)
+
+        self.win.refresh()
+
+    def update(self, event):
+        """Update the window state with a new event.
+
+        Args:
+            event (Event): Event.
+
+        """
+        pass
+
+
+################################################################################
+
+
+Windows = collections.namedtuple("Windows", ["overview", "monitor", "logging", "statusbar"])
+"""Container for the four active windows of minertop."""
+
+
+def handle_event(event, windows):
+    """Handle new minerd Event.
+
+    Args:
+        event (Event): Event.
+        windows (Windows): minertop windows.
+
+    """
+    windows.overview.update(event)
+    windows.monitor.update(event)
+    windows.logging.update(event)
+    windows.statusbar.update(event)
+
+
+def handle_input(character, windows):
+    """Handle keyboard input event.
+
+    Args:
+        character (str): Character entered.
+        windows (Windows): minertop windows.
+
+    """
+    pass
+
+
+def handle_resize(screen, windows):
+    """Handle resize event.
+
+    Args:
+        screen (curses.WindowObject): Top-level curses screen.
+        windows (Windows): minertop windows.
+
+    """
+    # Get new terminal size
+    (width, height) = os.get_terminal_size()
+
+    # Resize curses
+    curses.resize_term(height, width)
+    # Resize screen
+    screen.resize(height, width)
+
+    # Recalculate top windows height
+    new_top_window_height = min(TOP_WINDOW_HEIGHT, height // 2)
+
+    # Recreate windows
+    del windows.overview.win
+    windows.overview.win = screen.subwin(new_top_window_height, width // 2, 0, 0)
+    del windows.monitor.win
+    windows.monitor.win = screen.subwin(new_top_window_height, width - width // 2, 0, width // 2)
+    del windows.logging.win
+    windows.logging.win = screen.subwin(height - new_top_window_height - 1, width, new_top_window_height, 0)
+    del windows.statusbar.win
+    windows.statusbar.win = screen.subwin(1, width, height - 1, 0)
+
+    # Resize windows
+    windows.overview.resize()
+    windows.monitor.resize()
+    windows.logging.resize()
+    windows.statusbar.resize()
+
+
+def ui_main(screen, sock):
+    """Main minertop program loop.
+
+    Args:
+        screen (curses.WindowObject): Top-level curses screen.
+        sock (socket.socket): Socket connected to minerd.
+
+    """
+    # Clear screen
+    screen.clear()
+    # Make cursor invisible
+    curses.curs_set(0)
+    # Disable newline
+    curses.nonl()
+    # Enable colors
+    curses.start_color()
+    curses.use_default_colors()
+    for color in [curses.COLOR_RED, curses.COLOR_BLUE, curses.COLOR_GREEN,
+                  curses.COLOR_MAGENTA, curses.COLOR_CYAN, curses.COLOR_YELLOW]:
+        curses.init_pair(color, color, -1)
+
+    # Get screen dimensions
+    screen_height, screen_width = screen.getmaxyx()
+
+    # Calculate top windows height
+    top_window_height = min(TOP_WINDOW_HEIGHT, screen_height // 2)
+
+    # Make three windows
+    overview_window = OverviewWindow(screen.subwin(top_window_height, screen_width // 2, 0, 0))
+    monitor_window = MonitorWindow(screen.subwin(top_window_height, screen_width - screen_width // 2, 0, screen_width // 2))
+    logging_window = LoggingWindow(screen.subwin(screen_height - top_window_height - 1, screen_width, top_window_height, 0))
+    statusbar_window = StatusBarWindow(screen.subwin(1, screen_width, screen_height - 1, 0))
+
+    windows = Windows(overview_window, monitor_window, logging_window, statusbar_window)
+
+    # Install signal handler for terminal window resize
+    signal.signal(signal.SIGWINCH, lambda signum, frame: handle_resize(screen, windows))
+
+    # Receive buffer
+    buf = b""
+
+    rlist = [sys.stdin, sock]
+
+    while True:
+        # Select between stdin and socket
+        try:
+            readable, _, _ = select.select(rlist, [], [])
+        except InterruptedError:
+            continue
+
+        # Handle stdin
+        if sys.stdin in readable:
+            ch = sys.stdin.read(1)
+            if ch in ['q', 'Q']:
+                break
+            handle_input(ch, windows)
+
+        # Handle socket
+        if sock in readable:
+            chunk = sock.recv(4096)
+
+            # If server disconnected
+            if chunk == b"":
+                handle_event(DisconnectEvent(), windows)
+                sock.close()
+                rlist.remove(sock)
+
+            buf += chunk
+            # Search for \n delimited JSON events in buffer
+            while b"\n" in buf:
+                pos = buf.find(b"\n")
+                data = buf[0:pos].decode('utf-8')
+                buf = buf[pos + 1:]
+
+                event = Event.from_json(data)
+                handle_event(event, windows)
+
+
+if __name__ == "__main__":
+    # Connect to daemon
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect("/tmp/minerd.sock")
+    except FileNotFoundError:
+        sys.stderr.write("minerd socket not found.\n")
+        sys.stderr.write("minerd is not running.\n")
+        sys.exit(1)
+    except ConnectionRefusedError:
+        sys.stderr.write("minerd socket connection refused.\n")
+        sys.stderr.write("is minerd running?\n")
+        sys.exit(1)
+
+    try:
+        curses.wrapper(ui_main, s)
+    except DimensionsError as e:
+        sys.stderr.write(str(e) + "\n")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        pass
+    except:
+        raise
